@@ -14,6 +14,7 @@ import {
   type LlmMessageDTO,
   type MessageRole,
   type SchemaPreset,
+  type TemplateEngine,
   type StructuredOutputMode,
   type TrackerJobState,
   type TrackerMetadataMirror,
@@ -28,11 +29,12 @@ import {
   defaultSchemaPresets,
   defaultSettings,
   formatTrackerSnapshot,
+  getTemplateCompatibilityWarnings,
   getSchemaPreset,
   getTopLevelSchemaKeys,
+  assertTrackerTemplateRenders,
   isPlainObject,
   jobsPath,
-  renderTrackerTemplate,
   safePreview,
   safeRenderTracker,
   sanitizeSchemaPresetMap,
@@ -55,6 +57,7 @@ interface TrackerPresetRuntime {
   xmlPromptTemplate: string;
   toonPromptTemplate: string;
   structuredOutputMode: StructuredOutputMode;
+  templateEngine: TemplateEngine;
 }
 
 interface BackendJob {
@@ -201,8 +204,13 @@ async function loadSettings(userId: string): Promise<TracktorSettings> {
   return settings;
 }
 
-async function saveSettings(settings: TracktorSettings, userId: string): Promise<TracktorSettings> {
+async function saveSettings(settings: TracktorSettings, userId: string, validatePresetKey?: string): Promise<TracktorSettings> {
   const merged = deepMergeSettings(settings, settings.schemaPresets);
+  if (validatePresetKey) {
+    const preset = getSchemaPreset(merged, validatePresetKey);
+    const runtime = resolvePresetRuntime(merged, preset);
+    await assertRuntimeTemplateRenders(userId, preset, runtime, schemaToExample(runtime.schema));
+  }
   settingsCache.set(userId, merged);
   await Promise.all([
     spindle.userStorage.setJson(SETTINGS_PATH, settingsForStorage(merged), { indent: 2, userId }),
@@ -247,6 +255,7 @@ function normalizeSnapshot(input: unknown, fallbackChatId: string): TrackerSnaps
     partsOrder: Array.isArray(input.partsOrder) ? input.partsOrder.filter((part): part is string => typeof part === 'string') : [],
     partsMeta: isPlainObject(input.partsMeta) ? input.partsMeta : {},
     pendingRedactions: isPlainObject(input.pendingRedactions) ? input.pendingRedactions : {},
+    templateEngine: input.templateEngine === 'simple' || input.templateEngine === 'handlebars' ? input.templateEngine : undefined,
     createdAt: typeof input.createdAt === 'number' ? input.createdAt : now,
     updatedAt: typeof input.updatedAt === 'number' ? input.updatedAt : now,
   }];
@@ -393,6 +402,7 @@ function resolvePresetRuntime(settings: TracktorSettings, preset: SchemaPreset):
     xmlPromptTemplate: preset.xmlPromptTemplate || settings.xmlPromptTemplate || defaultSettings.xmlPromptTemplate,
     toonPromptTemplate: preset.toonPromptTemplate || settings.toonPromptTemplate || defaultSettings.toonPromptTemplate,
     structuredOutputMode: preset.structuredOutputMode ?? settings.structuredOutputMode,
+    templateEngine: preset.templateEngine ?? settings.templateEngine ?? 'handlebars',
   };
 }
 
@@ -402,6 +412,34 @@ async function addGenerationDiagnosticOnce(userId: string, key: string, message:
   if (generationDiagnostics.has(diagnosticKey)) return;
   generationDiagnostics.add(diagnosticKey);
   await addDiagnostic(userId, message);
+}
+
+async function assertRuntimeTemplateRenders(
+  userId: string,
+  preset: SchemaPreset,
+  runtime: TrackerPresetRuntime,
+  data: unknown,
+  savedTemplate?: string,
+  templateEngine?: TemplateEngine,
+): Promise<void> {
+  const template = savedTemplate ?? runtime.renderTemplate;
+  const engine = templateEngine ?? runtime.templateEngine;
+  for (const warning of getTemplateCompatibilityWarnings(template)) {
+    await addGenerationDiagnosticOnce(userId, `template-warning:${preset.key}:${warning}`, `Tracktor template warning for "${preset.name}" (${preset.key}): ${warning}`);
+  }
+  try {
+    assertTrackerTemplateRenders(template, data, {
+      templateEngine: engine,
+      label: `Tracker preset "${preset.name}" (${preset.key})`,
+      onWarning: (message) => {
+        void addDiagnostic(userId, `Tracktor template warning for "${preset.name}" (${preset.key}): ${message}`);
+      },
+    });
+  } catch (error) {
+    const message = `Tracktor template render failed for "${preset.name}" (${preset.key}): ${error instanceof Error ? error.message : String(error)}`;
+    spindle.log.warn(message);
+    throw new Error(message);
+  }
 }
 
 async function generateTrackerForMessage(options: {
@@ -446,7 +484,7 @@ async function generateTrackerForMessage(options: {
 
   assertSchemaRequired(data, runtime.schema);
   const snapshot = makeTrackerSnapshot(chat.id, target.id, preset, runtime, data, snapshots.find((item) => item.messageId === target.id));
-  renderTrackerTemplate(snapshot.renderTemplate, snapshot.value);
+  await assertRuntimeTemplateRenders(options.userId, preset, runtime, snapshot.value, snapshot.renderTemplate, snapshot.templateEngine);
   await persistTrackerSnapshot(options.userId, target, snapshot, settings);
   return snapshot;
 }
@@ -663,6 +701,7 @@ function makeTrackerSnapshot(
     partsOrder: getTopLevelSchemaKeys(runtime.schema),
     partsMeta: existing?.partsMeta ?? {},
     pendingRedactions: existing?.pendingRedactions ?? {},
+    templateEngine: existing?.templateEngine ?? runtime.templateEngine,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
@@ -702,7 +741,7 @@ async function updateTrackerData(userId: string, chatId: string, messageId: stri
   const snapshot = makeTrackerSnapshot(chatId, messageId, preset, runtime, data, current, {
     renderTemplate: current?.renderTemplate || runtime.renderTemplate,
   });
-  renderTrackerTemplate(snapshot.renderTemplate, snapshot.value);
+  await assertRuntimeTemplateRenders(userId, preset, runtime, snapshot.value, snapshot.renderTemplate, snapshot.templateEngine);
   await persistTrackerSnapshot(userId, message, snapshot, settings);
 }
 
@@ -728,6 +767,7 @@ async function regeneratePart(userId: string, chatId: string, messageId: string,
   if (!isPlainObject(part) || !(partKey in part)) throw new Error(`Part response did not include "${partKey}".`);
   const next = { ...snapshot.value, [partKey]: part[partKey] };
   const updated = makeTrackerSnapshot(chatId, messageId, preset, runtime, next, snapshot);
+  await assertRuntimeTemplateRenders(userId, preset, runtime, updated.value, updated.renderTemplate, updated.templateEngine);
   await persistTrackerSnapshot(userId, message, updated, settings);
 }
 
@@ -836,6 +876,7 @@ async function runJob(userId: string, chatId: string | undefined, messageId: str
     lastErrors.set(userId, message);
     finishJob(job, 'failed', message);
     spindle.toast.error(message, { title: 'Tracktor', duration: 10000 });
+    await addDiagnostic(userId, message);
     await sendState(userId, resolvedChatId);
   }
 }
@@ -858,7 +899,8 @@ spindle.onFrontendMessage(async (payload: FrontendMessage, rawUserId: string | u
         break;
 
       case 'save_settings': {
-        await saveSettings(payload.settings, userId);
+        const validatePresetKey = typeof payload.validatePresetKey === 'string' ? payload.validatePresetKey : undefined;
+        await saveSettings(payload.settings, userId, validatePresetKey);
         spindle.toast.success('Settings saved.', { title: 'Tracktor' });
         await sendState(userId, chatId);
         break;

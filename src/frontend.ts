@@ -2,9 +2,11 @@ import {
   type ConnectionOption,
   type FrontendState,
   type SchemaPreset,
+  type TemplateEngine,
   type TrackerSummary,
   type TracktorSettings,
   type StructuredOutputMode,
+  assertTrackerTemplateRenders,
   DEFAULT_JSON_PROMPT_TEMPLATE,
   DEFAULT_TOON_PROMPT_TEMPLATE,
   DEFAULT_XML_PROMPT_TEMPLATE,
@@ -13,8 +15,10 @@ import {
   defaultSettings,
   deepMergeSettings,
   escapeHtml,
+  getTemplateCompatibilityWarnings,
   safePreview,
   sanitizeId,
+  schemaToExample,
   stripDangerousHtml,
 } from './shared.js';
 
@@ -588,6 +592,11 @@ function renderSettings(settings: TracktorSettings, current?: FrontendState): st
           <label>Lumiverse generation preset
             <input data-setting="trackerPresetId" value="${escapeHtml(settings.trackerPresetId ?? '')}" placeholder="Optional id">
           </label>
+        <label>Template engine
+          <select data-setting="templateEngine">
+            ${renderTemplateEngineOptions(settings.templateEngine)}
+          </select>
+        </label>
         <label>Recent messages
           <input data-setting="trackerContextMessageLimit" type="number" min="0" max="400" value="${settings.trackerContextMessageLimit}">
         </label>
@@ -720,6 +729,14 @@ function renderStructuredOutputOptions(value: StructuredOutputMode | undefined, 
   `;
 }
 
+function renderTemplateEngineOptions(value: TemplateEngine | undefined, includeEmpty = false): string {
+  const empty = includeEmpty ? `<option value="" ${value ? '' : 'selected'}>Use global template engine</option>` : '';
+  return `${empty}
+    <option value="handlebars" ${value === 'handlebars' ? 'selected' : ''}>Handlebars</option>
+    <option value="simple" ${value === 'simple' ? 'selected' : ''}>Simple fallback</option>
+  `;
+}
+
 function formatConnectionLabel(connection: ConnectionOption): string {
   const detail = [connection.provider, connection.model].filter(Boolean).join(' / ');
   return detail ? `${connection.name} (${detail})` : connection.name;
@@ -755,6 +772,11 @@ function renderSchemaEditor(settings: TracktorSettings, current?: FrontendState)
           <label>Preset output override
             <select data-preset-field="structuredOutputMode">
               ${renderStructuredOutputOptions(active.structuredOutputMode, true)}
+            </select>
+          </label>
+          <label>Template engine
+            <select data-preset-field="templateEngine">
+              ${renderTemplateEngineOptions(active.templateEngine, true)}
             </select>
           </label>
         </div>
@@ -906,7 +928,7 @@ function savePresetFromDom(editor: HTMLElement): void {
     }
     settings.schemaPresets[preset.key] = preset;
     setActivePreset(settings, preset.key);
-    persistSettings(settings);
+    persistSettings(settings, preset.key);
   } catch (error) {
     showErrorModal(error instanceof Error ? error.message : String(error));
   }
@@ -921,7 +943,8 @@ function readPresetFromDom(editor: HTMLElement, previous?: SchemaPreset): Schema
   }
   const templateHtml = readPresetField(editor, 'templateHtml') || previous?.templateHtml || defaultSettings.schemaPresets.scene.templateHtml;
   const mode = readPresetField(editor, 'structuredOutputMode') as StructuredOutputMode | '';
-  return {
+  const templateEngine = readPresetField(editor, 'templateEngine') as TemplateEngine | '';
+  const preset: SchemaPreset = {
     id,
     key: id,
     name: readPresetField(editor, 'name') || previous?.name || id,
@@ -937,9 +960,18 @@ function readPresetFromDom(editor: HTMLElement, previous?: SchemaPreset): Schema
     xmlPromptTemplate: readPresetField(editor, 'xmlPromptTemplate') || previous?.xmlPromptTemplate || DEFAULT_XML_PROMPT_TEMPLATE,
     toonPromptTemplate: readPresetField(editor, 'toonPromptTemplate') || previous?.toonPromptTemplate || DEFAULT_TOON_PROMPT_TEMPLATE,
     ...(mode ? { structuredOutputMode: mode } : {}),
+    ...(templateEngine ? { templateEngine } : {}),
     createdAt: previous?.createdAt ?? Date.now(),
     updatedAt: Date.now(),
   };
+  const engine = preset.templateEngine ?? state?.settings.templateEngine ?? 'handlebars';
+  assertTrackerTemplateRenders(preset.renderTemplate, schemaToExample(preset.schema), {
+    templateEngine: engine,
+    label: `Tracker preset "${preset.name}" (${preset.key})`,
+  });
+  const warnings = getTemplateCompatibilityWarnings(preset.renderTemplate);
+  if (warnings.length > 0) console.warn(`Tracktor preset "${preset.name}" (${preset.key}) warnings: ${warnings.join(' ')}`);
+  return preset;
 }
 
 function readPresetField(editor: HTMLElement, field: string): string {
@@ -967,7 +999,7 @@ function createNewPreset(): void {
     updatedAt: Date.now(),
   };
   setActivePreset(settings, key);
-  persistSettings(settings);
+  persistSettings(settings, key);
 }
 
 function duplicateActivePreset(): void {
@@ -985,7 +1017,7 @@ function duplicateActivePreset(): void {
     updatedAt: Date.now(),
   };
   setActivePreset(settings, key);
-  persistSettings(settings);
+  persistSettings(settings, key);
 }
 
 async function deleteActivePreset(): Promise<void> {
@@ -1012,7 +1044,7 @@ function restoreBuiltInPreset(): void {
   const settings = structuredClone(state.settings);
   settings.schemaPresets.scene = structuredClone(defaultSettings.schemaPresets.scene);
   setActivePreset(settings, 'scene');
-  persistSettings(settings);
+  persistSettings(settings, 'scene');
 }
 
 function makeUniquePresetKey(settings: TracktorSettings, base: string): string {
@@ -1032,10 +1064,10 @@ function setActivePreset(settings: TracktorSettings, key: string): void {
   settings.activeSchemaId = key;
 }
 
-function persistSettings(settings: TracktorSettings): void {
+function persistSettings(settings: TracktorSettings, validatePresetKey?: string): void {
   if (!state) return;
   state.settings = deepMergeSettings(settings, settings.schemaPresets);
-  ctxRef.sendToBackend({ type: 'save_settings', settings: state.settings });
+  ctxRef.sendToBackend({ type: 'save_settings', settings: state.settings, ...(validatePresetKey ? { validatePresetKey } : {}) });
   render();
 }
 

@@ -1,9 +1,11 @@
+import Handlebars from 'handlebars';
+
 export const EXTENSION_ID = 'tracktor';
 export const METADATA_KEY = 'tracktor';
 export const SETTINGS_PATH = 'settings.json';
 export const SCHEMA_PRESETS_PATH = 'schema-presets.json';
 export const DIAGNOSTICS_PATH = 'diagnostics/latest.json';
-export const VERSION = '0.3.0';
+export const VERSION = '0.3.1';
 
 export type MessageRole = 'system' | 'user' | 'assistant';
 export type TrackerAutoMode = 'none' | 'responses' | 'inputs' | 'both';
@@ -11,6 +13,7 @@ export type StructuredOutputMode = 'native_json_schema' | 'json_prompt' | 'xml_p
 export type TrackerConversationRoleMode = 'preserve' | 'all_assistant' | 'plain_transcript';
 export type TrackerWorldBookMode = 'include_all' | 'exclude_all' | 'allowlist';
 export type SnapshotTransformPresetKey = 'default_json' | 'minimal' | 'toon' | 'custom';
+export type TemplateEngine = 'handlebars' | 'simple';
 
 export interface LlmMessageDTO {
   role: MessageRole;
@@ -53,6 +56,7 @@ export interface SchemaPreset {
   xmlPromptTemplate: string;
   toonPromptTemplate: string;
   structuredOutputMode?: StructuredOutputMode;
+  templateEngine?: TemplateEngine;
   createdAt: number;
   updatedAt: number;
 }
@@ -69,6 +73,7 @@ export interface TrackerSnapshot {
   partsOrder: string[];
   partsMeta: Record<string, unknown>;
   pendingRedactions: Record<string, unknown>;
+  templateEngine?: TemplateEngine;
   createdAt: number;
   updatedAt: number;
 }
@@ -90,6 +95,7 @@ export interface TrackerRecord {
   schemaName: string;
   schema: Record<string, unknown>;
   templateHtml: string;
+  templateEngine?: TemplateEngine;
   data: unknown;
   renderedHtml: string;
   updatedAt: string;
@@ -161,6 +167,7 @@ export interface TracktorSettings {
   allowedWorldBookIds: string[];
   allowedWorldBookEntryIds: string[];
   debugLogging: boolean;
+  templateEngine: TemplateEngine;
 }
 
 export interface ChatTracktorConfig {
@@ -323,6 +330,7 @@ export const defaultSchemaPresets: Record<string, SchemaPreset> = {
     jsonPromptTemplate: DEFAULT_JSON_PROMPT_TEMPLATE,
     xmlPromptTemplate: DEFAULT_XML_PROMPT_TEMPLATE,
     toonPromptTemplate: DEFAULT_TOON_PROMPT_TEMPLATE,
+    templateEngine: 'handlebars',
   }, 'scene'),
 };
 
@@ -408,6 +416,7 @@ export const defaultSettings: TracktorSettings = {
   allowedWorldBookIds: [],
   allowedWorldBookEntryIds: [],
   debugLogging: false,
+  templateEngine: 'handlebars',
 };
 
 export function deepMergeSettings(input: unknown, schemaPresets?: Record<string, SchemaPreset>): TracktorSettings {
@@ -455,6 +464,7 @@ export function deepMergeSettings(input: unknown, schemaPresets?: Record<string,
   merged.structuredOutputMode = normalizeStructuredOutputMode(saved.structuredOutputMode ?? saved.generationMode);
   merged.generationMode = merged.structuredOutputMode === 'native_json_schema' ? 'native_json' : 'json';
   merged.trackerConversationRoleMode = normalizeEnum(saved.trackerConversationRoleMode, ['preserve', 'all_assistant', 'plain_transcript'], 'preserve');
+  merged.templateEngine = normalizeTemplateEngine(saved.templateEngine);
   merged.snapshotRole = normalizeEnum(saved.snapshotRole, ['system', 'user', 'assistant'], 'system');
   merged.trackerWorldBookMode = normalizeEnum(saved.trackerWorldBookMode, ['include_all', 'exclude_all', 'allowlist'], 'include_all');
   merged.snapshotTransformPresetKey = normalizeEnum(saved.snapshotTransformPresetKey, ['default_json', 'minimal', 'toon', 'custom'], 'default_json');
@@ -541,6 +551,7 @@ type PresetPromptDefaults = Partial<Pick<
   | 'jsonPromptTemplate'
   | 'xmlPromptTemplate'
   | 'toonPromptTemplate'
+  | 'templateEngine'
 >>;
 
 export function sanitizeSchemaPresetMap(input: unknown, promptDefaults: PresetPromptDefaults = defaultSettings): Record<string, SchemaPreset> {
@@ -589,6 +600,7 @@ export function normalizeSchemaPreset(
     jsonPromptTemplate: readString(value.jsonPromptTemplate) || readString(promptDefaults.jsonPromptTemplate) || DEFAULT_JSON_PROMPT_TEMPLATE,
     xmlPromptTemplate: readString(value.xmlPromptTemplate) || readString(promptDefaults.xmlPromptTemplate) || DEFAULT_XML_PROMPT_TEMPLATE,
     toonPromptTemplate: readString(value.toonPromptTemplate) || readString(promptDefaults.toonPromptTemplate) || DEFAULT_TOON_PROMPT_TEMPLATE,
+    templateEngine: normalizeTemplateEngine(value.templateEngine ?? promptDefaults.templateEngine),
     createdAt: sanitizeInteger(value.createdAt, now, 0, Number.MAX_SAFE_INTEGER),
     updatedAt: sanitizeInteger(value.updatedAt, now, 0, Number.MAX_SAFE_INTEGER),
   };
@@ -664,14 +676,60 @@ export function schemaToExample(schema: unknown): unknown {
   }
 }
 
-export function renderTrackerTemplate(templateHtml: string, data: unknown): string {
-  const withoutScripts = stripDangerousHtml(templateHtml);
-  return renderScopedTemplate(withoutScripts, data, data);
+export function renderTrackerTemplate(
+  templateHtml: string,
+  data: unknown,
+  options: { templateEngine?: TemplateEngine; onWarning?: (message: string) => void } = {},
+): string {
+  const engine = options.templateEngine ?? 'handlebars';
+  const sanitizedTemplate = stripDangerousHtml(templateHtml);
+  try {
+    const rendered = engine === 'simple'
+      ? renderScopedTemplate(sanitizedTemplate, data, data)
+      : renderHandlebarsTemplate(sanitizedTemplate, data);
+    return stripDangerousHtml(rendered);
+  } catch (error) {
+    if (engine !== 'simple' && error instanceof Error && error.message === 'Handlebars renderer is unavailable.') {
+      options.onWarning?.(`Handlebars template renderer failed; falling back to simple renderer: ${error instanceof Error ? error.message : String(error)}`);
+      return stripDangerousHtml(renderScopedTemplate(sanitizedTemplate, data, data));
+    }
+    throw error;
+  }
+}
+
+export function assertTrackerTemplateRenders(
+  templateHtml: string,
+  data: unknown,
+  options: { templateEngine?: TemplateEngine; label?: string; onWarning?: (message: string) => void } = {},
+): string {
+  try {
+    return renderTrackerTemplate(templateHtml, data, options);
+  } catch (error) {
+    const label = options.label ? `${options.label}: ` : '';
+    throw new Error(`${label}Template render failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+export function testRenderTrackerPreset(preset: SchemaPreset, settings?: Partial<TracktorSettings>): string {
+  const engine = preset.templateEngine ?? settings?.templateEngine ?? 'handlebars';
+  return assertTrackerTemplateRenders(preset.renderTemplate || preset.templateHtml, schemaToExample(preset.schema), {
+    templateEngine: engine,
+    label: `Tracker preset "${preset.name}" (${preset.key})`,
+  });
+}
+
+export function getTemplateCompatibilityWarnings(templateHtml: string): string[] {
+  const warnings: string[] = [];
+  if (/{{{\s*[\s\S]*?}}}/.test(templateHtml) || /{{&\s*[^}]+}}/.test(templateHtml)) {
+    warnings.push('Template uses unescaped Handlebars output. Tracktor sanitizes rendered HTML, but normal {{...}} output is safer.');
+  }
+  return warnings;
 }
 
 export function snapshotToRecord(snapshot: TrackerSnapshot, preset?: SchemaPreset): TrackerRecord {
   const schema = preset?.schema ?? preset?.jsonSchema ?? {};
   const template = snapshot.renderTemplate || preset?.templateHtml || preset?.renderTemplate || '';
+  const templateEngine = snapshot.templateEngine ?? preset?.templateEngine ?? 'handlebars';
   return {
     version: VERSION,
     snapshotId: snapshot.id,
@@ -679,17 +737,22 @@ export function snapshotToRecord(snapshot: TrackerSnapshot, preset?: SchemaPrese
     schemaName: preset?.name ?? snapshot.schemaPresetKey,
     schema,
     templateHtml: template,
+    templateEngine,
     data: snapshot.value,
-    renderedHtml: safeRenderTracker(template, snapshot.value),
+    renderedHtml: safeRenderTracker(template, snapshot.value, { templateEngine }),
     updatedAt: new Date(snapshot.updatedAt).toISOString(),
     sourceMessageId: snapshot.messageId,
     pendingRedactions: snapshot.pendingRedactions,
   };
 }
 
-export function safeRenderTracker(templateHtml: string, data: unknown): string {
+export function safeRenderTracker(
+  templateHtml: string,
+  data: unknown,
+  options: { templateEngine?: TemplateEngine; onWarning?: (message: string) => void } = {},
+): string {
   try {
-    return renderTrackerTemplate(templateHtml, data);
+    return renderTrackerTemplate(templateHtml, data, options);
   } catch {
     return `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
   }
@@ -743,10 +806,13 @@ export function escapeHtml(value: unknown): string {
 export function stripDangerousHtml(html: string): string {
   return html
     .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
+    .replace(/<iframe[\s\S]*?>[\s\S]*?<\/iframe>/gi, '')
+    .replace(/<iframe\b[^>]*\/?>/gi, '')
     .replace(/\son[a-z]+\s*=\s*"[^"]*"/gi, '')
     .replace(/\son[a-z]+\s*=\s*'[^']*'/gi, '')
     .replace(/\son[a-z]+\s*=\s*[^\s>]+/gi, '')
-    .replace(/\s(href|src)\s*=\s*(['"])\s*javascript:[\s\S]*?\2/gi, '');
+    .replace(/\s(href|src)\s*=\s*(['"])\s*javascript:[\s\S]*?\2/gi, '')
+    .replace(/\s(href|src)\s*=\s*javascript:[^\s>]+/gi, '');
 }
 
 export function sanitizeId(value: string): string {
@@ -810,6 +876,10 @@ function normalizeStructuredOutputMode(value: unknown): StructuredOutputMode {
   return normalizeEnum(value, ['native_json_schema', 'json_prompt', 'xml_prompt', 'toon_prompt'], 'json_prompt');
 }
 
+function normalizeTemplateEngine(value: unknown): TemplateEngine {
+  return normalizeEnum(value, ['handlebars', 'simple'], 'handlebars');
+}
+
 function normalizeOptionalStructuredOutputMode(value: unknown): StructuredOutputMode | undefined {
   if (value === undefined || value === null || value === '') return undefined;
   return normalizeStructuredOutputMode(value);
@@ -849,6 +919,35 @@ function sanitizeInteger(value: unknown, fallback: number, min: number, max: num
   const parsed = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+const handlebarsRuntime = (() => {
+  try {
+    const runtime = Handlebars.create();
+    runtime.registerHelper('join', (value: unknown, separator: unknown) => {
+      if (!Array.isArray(value)) return '';
+      const delimiter = typeof separator === 'string' ? separator : ', ';
+      return value.map((item) => typeof item === 'object' ? JSON.stringify(item) : String(item ?? '')).join(delimiter);
+    });
+    runtime.registerHelper('json', (value: unknown) => JSON.stringify(value, null, 2));
+    return runtime;
+  } catch {
+    return null;
+  }
+})();
+
+function renderHandlebarsTemplate(template: string, data: unknown): string {
+  if (!handlebarsRuntime) {
+    throw new Error('Handlebars renderer is unavailable.');
+  }
+  const compiled = handlebarsRuntime.compile(template, {
+    noEscape: false,
+    strict: false,
+  });
+  return compiled({ data }, {
+    allowProtoMethodsByDefault: false,
+    allowProtoPropertiesByDefault: false,
+  });
 }
 
 function renderScopedTemplate(template: string, scope: unknown, rootData: unknown): string {

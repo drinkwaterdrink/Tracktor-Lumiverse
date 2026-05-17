@@ -1,14 +1,18 @@
 {
   "name": "lumiverse-tracktor",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Flexible tracker extension for Lumiverse Spindle.",
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && npm run bundle",
+    "bundle": "npm run bundle:backend && npm run bundle:frontend",
+    "bundle:backend": "esbuild ./src/backend.ts --bundle --platform=node --format=esm --target=es2022 --outfile=./dist/backend.js",
+    "bundle:frontend": "esbuild ./src/frontend.ts --bundle --platform=browser --format=esm --target=es2022 --outfile=./dist/frontend.js",
     "check": "tsc -p tsconfig.json --noEmit",
     "smoke": "node scripts/smoke-test.mjs"
   },
   "devDependencies": {
+    "esbuild": "^0.28.0",
     "typescript": "^5.7.3"
   }
 }

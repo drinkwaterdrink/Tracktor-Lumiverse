@@ -64,7 +64,7 @@ function hasPermission(permission: string): boolean {
 
 function permissionWarnings(): string[] {
   const warnings: string[] = [];
-  for (const permission of ['generation', 'chats', 'chat_mutation', 'interceptor']) {
+  for (const permission of ['generation', 'chats', 'chat_mutation', 'interceptor', 'ui_panels', 'app_manipulation']) {
     if (!hasPermission(permission)) warnings.push(permission);
   }
   return warnings;
@@ -163,8 +163,8 @@ async function generateTrackerForMessage(options: {
   const preset = getSchemaPreset(settings, chatConfig.schemaId);
   const sequential = options.sequential ?? settings.sequentialPartGeneration;
   const data = sequential
-    ? await generateTrackerSequential(messages, targetIndex, settings, preset)
-    : await generateTrackerFull(messages, targetIndex, settings, preset);
+    ? await generateTrackerSequential(messages, targetIndex, settings, preset, options.userId)
+    : await generateTrackerFull(messages, targetIndex, settings, preset, options.userId);
 
   const record = makeTrackerRecord(target.id, preset, data);
   await persistTrackerRecord(chat.id, target, record, settings);
@@ -176,9 +176,10 @@ async function generateTrackerFull(
   targetIndex: number,
   settings: TracktorSettings,
   preset: SchemaPreset,
+  userId?: string,
 ): Promise<unknown> {
   const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset);
-  return requestJsonForSchema(prompt, preset.schema, 'tracktor_tracker', settings);
+  return requestJsonForSchema(prompt, preset.schema, 'tracktor_tracker', settings, userId);
 }
 
 async function generateTrackerSequential(
@@ -186,6 +187,7 @@ async function generateTrackerSequential(
   targetIndex: number,
   settings: TracktorSettings,
   preset: SchemaPreset,
+  userId?: string,
 ): Promise<Record<string, unknown>> {
   const keys = getTopLevelSchemaKeys(preset.schema);
   if (keys.length === 0) throw new Error('The active tracker schema has no top-level properties.');
@@ -197,7 +199,7 @@ async function generateTrackerSequential(
       partKey: key,
       trackerSoFar: tracker,
     });
-    const part = await requestJsonForSchema(prompt, partSchema, `tracktor_${key}`, settings);
+    const part = await requestJsonForSchema(prompt, partSchema, `tracktor_${key}`, settings, userId);
     if (!part || typeof part !== 'object' || !(key in (part as Record<string, unknown>))) {
       throw new Error(`Part response did not include "${key}".`);
     }
@@ -211,6 +213,7 @@ async function requestJsonForSchema(
   schema: Record<string, unknown>,
   schemaName: string,
   settings: TracktorSettings,
+  userId?: string,
 ): Promise<unknown> {
   const parameters: Record<string, unknown> = {
     max_tokens: settings.maxResponseTokens,
@@ -234,8 +237,10 @@ async function requestJsonForSchema(
   }
 
   const result = await spindle.generate.quiet({
+    type: 'quiet',
     messages,
     parameters,
+    ...(userId ? { userId } : {}),
   });
 
   if (result?.content && typeof result.content === 'object') {

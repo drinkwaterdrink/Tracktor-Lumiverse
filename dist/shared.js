@@ -1,7 +1,7 @@
 export const EXTENSION_ID = 'tracktor';
 export const METADATA_KEY = 'tracktor';
 export const SETTINGS_PATH = 'settings.json';
-export const VERSION = '0.1.0';
+export const VERSION = '0.1.2';
 export const DEFAULT_SYSTEM_PROMPT = `You are a structured tracker extraction assistant. Analyze the conversation and return only tracker data that matches the requested schema. Do not roleplay, continue the scene, explain yourself, or include markdown unless the tracker format instructions explicitly ask for it. Preserve continuity with previous tracker snapshots, but update the tracker from the newest chat evidence.`;
 export const DEFAULT_EXTRACTION_PROMPT = `Create a complete tracker update for the target message. Fill every required field. If a field is not explicitly stated, infer a short, reasonable value from the conversation context. Keep values concise and concrete.`;
 export const DEFAULT_SCHEMA = {

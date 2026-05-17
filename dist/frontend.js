@@ -1,139 +1,348 @@
-import { deepMergeSettings, escapeHtml, safePreview, sanitizeId, stripDangerousHtml, } from './shared.js';
-let state;
-let root;
-let ctxRef;
-const widgetCleanups = new Map();
-export function setup(ctx) {
-    ctxRef = ctx;
-    const removeStyle = ctx.dom.addStyle(STYLES);
-    const placement = createPlacement(ctx);
-    root = placement.root;
-    root.classList.add('tracktor-root');
-    const openAction = ctx.ui?.registerInputBarAction?.({
-        id: 'open-tracktor',
-        label: 'Open Tracktor',
-        enabled: true,
-        iconSvg: TRACKTOR_SMALL_ICON,
+// src/shared.ts
+var VERSION = "0.1.2";
+var DEFAULT_SYSTEM_PROMPT = `You are a structured tracker extraction assistant. Analyze the conversation and return only tracker data that matches the requested schema. Do not roleplay, continue the scene, explain yourself, or include markdown unless the tracker format instructions explicitly ask for it. Preserve continuity with previous tracker snapshots, but update the tracker from the newest chat evidence.`;
+var DEFAULT_EXTRACTION_PROMPT = `Create a complete tracker update for the target message. Fill every required field. If a field is not explicitly stated, infer a short, reasonable value from the conversation context. Keep values concise and concrete.`;
+var DEFAULT_SCHEMA = {
+  $schema: "http://json-schema.org/draft-07/schema#",
+  title: "SceneTracker",
+  type: "object",
+  properties: {
+    time: {
+      type: "string",
+      description: "Current in-scene time, including date if known."
+    },
+    location: {
+      type: "string",
+      description: "Specific current location."
+    },
+    situation: {
+      type: "string",
+      description: "One sentence summary of what is currently happening."
+    },
+    mood: {
+      type: "string",
+      description: "Dominant emotional tone."
+    },
+    charactersPresent: {
+      type: "array",
+      description: "Names of characters currently present.",
+      items: { type: "string" }
+    },
+    characters: {
+      type: "array",
+      description: "Visible state for each present character.",
+      "x-tracktor-idKey": "name",
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          appearance: { type: "string" },
+          outfit: { type: "string" },
+          posture: { type: "string" },
+          notableState: { type: "string" }
+        },
+        required: ["name", "appearance", "outfit", "posture", "notableState"]
+      }
+    },
+    openThreads: {
+      type: "array",
+      description: "Unresolved goals, tensions, promises, clues, or pending actions.",
+      items: { type: "string" }
+    }
+  },
+  required: ["time", "location", "situation", "mood", "charactersPresent", "characters", "openThreads"]
+};
+var DEFAULT_TEMPLATE_HTML = `
+<section class="tracktor-card">
+  <div class="tracktor-grid">
+    <div><strong>Time</strong><span>{{data.time}}</span></div>
+    <div><strong>Location</strong><span>{{data.location}}</span></div>
+    <div><strong>Mood</strong><span>{{data.mood}}</span></div>
+  </div>
+  <p class="tracktor-situation">{{data.situation}}</p>
+  <details>
+    <summary>Details</summary>
+    <p><strong>Present:</strong> {{join data.charactersPresent ', '}}</p>
+    {{#each data.characters}}
+      <div class="tracktor-character">
+        <strong>{{name}}</strong>
+        <span>{{appearance}}</span>
+        <span>{{outfit}}</span>
+        <span>{{posture}}</span>
+        <span>{{notableState}}</span>
+      </div>
+    {{/each}}
+    <p><strong>Open threads:</strong> {{join data.openThreads '; '}}</p>
+  </details>
+</section>
+`.trim();
+var defaultSettings = {
+  version: VERSION,
+  activeSchemaId: "scene",
+  schemaPresets: {
+    scene: {
+      id: "scene",
+      name: "Scene Tracker",
+      description: "General roleplay scene state.",
+      schema: DEFAULT_SCHEMA,
+      templateHtml: DEFAULT_TEMPLATE_HTML
+    }
+  },
+  generationMode: "json",
+  maxResponseTokens: 1800,
+  includeLastMessages: 12,
+  includeLastTrackers: 1,
+  sequentialPartGeneration: false,
+  autoMode: "off",
+  systemPrompt: DEFAULT_SYSTEM_PROMPT,
+  extractionPrompt: DEFAULT_EXTRACTION_PROMPT,
+  injection: {
+    enabled: true,
+    includeLastTrackers: 1,
+    role: "system",
+    header: "Recent tracker snapshot"
+  },
+  chatVariableExport: {
+    enabled: true,
+    key: "tracktor"
+  },
+  debugLogging: false
+};
+function deepMergeSettings(input) {
+  const saved = isPlainObject(input) ? input : {};
+  const merged = structuredClone(defaultSettings);
+  assignKnown(merged, saved, [
+    "version",
+    "activeSchemaId",
+    "generationMode",
+    "maxResponseTokens",
+    "includeLastMessages",
+    "includeLastTrackers",
+    "sequentialPartGeneration",
+    "autoMode",
+    "systemPrompt",
+    "extractionPrompt",
+    "debugLogging"
+  ]);
+  if (isPlainObject(saved.schemaPresets)) {
+    merged.schemaPresets = {};
+    for (const [id, value] of Object.entries(saved.schemaPresets)) {
+      if (!isPlainObject(value)) continue;
+      const preset = value;
+      if (!isPlainObject(preset.schema) || typeof preset.templateHtml !== "string") continue;
+      const normalizedId = sanitizeId(typeof preset.id === "string" ? preset.id : id) || id;
+      merged.schemaPresets[normalizedId] = {
+        id: normalizedId,
+        name: typeof preset.name === "string" && preset.name.trim() ? preset.name : normalizedId,
+        description: typeof preset.description === "string" ? preset.description : void 0,
+        schema: preset.schema,
+        templateHtml: preset.templateHtml
+      };
+    }
+    if (Object.keys(merged.schemaPresets).length === 0) {
+      merged.schemaPresets = structuredClone(defaultSettings.schemaPresets);
+    }
+  }
+  if (isPlainObject(saved.injection)) {
+    assignKnown(merged.injection, saved.injection, [
+      "enabled",
+      "includeLastTrackers",
+      "role",
+      "header"
+    ]);
+  }
+  if (isPlainObject(saved.chatVariableExport)) {
+    assignKnown(merged.chatVariableExport, saved.chatVariableExport, ["enabled", "key"]);
+  }
+  merged.activeSchemaId = merged.schemaPresets[merged.activeSchemaId] ? merged.activeSchemaId : Object.keys(merged.schemaPresets)[0];
+  merged.maxResponseTokens = sanitizeInteger(merged.maxResponseTokens, 1800, 1, 64e3);
+  merged.includeLastMessages = sanitizeInteger(merged.includeLastMessages, 12, 1, 200);
+  merged.includeLastTrackers = sanitizeInteger(merged.includeLastTrackers, 1, 0, 25);
+  merged.injection.includeLastTrackers = sanitizeInteger(merged.injection.includeLastTrackers, 1, 0, 25);
+  merged.generationMode = merged.generationMode === "native_json" ? "native_json" : "json";
+  merged.autoMode = ["off", "assistant_message", "user_message"].includes(merged.autoMode) ? merged.autoMode : "off";
+  merged.injection.role = ["system", "user", "assistant"].includes(merged.injection.role) ? merged.injection.role : "system";
+  merged.chatVariableExport.key = sanitizeVariableKey(merged.chatVariableExport.key) || "tracktor";
+  return merged;
+}
+function safePreview(value, max = 160) {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (compact.length <= max) return compact;
+  return `${compact.slice(0, Math.max(0, max - 1))}...`;
+}
+function escapeHtml(value) {
+  return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+}
+function stripDangerousHtml(html) {
+  return html.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "").replace(/\son[a-z]+\s*=\s*"[^"]*"/gi, "").replace(/\son[a-z]+\s*=\s*'[^']*'/gi, "").replace(/\son[a-z]+\s*=\s*[^\s>]+/gi, "").replace(/\s(href|src)\s*=\s*(['"])\s*javascript:[\s\S]*?\2/gi, "");
+}
+function sanitizeId(value) {
+  return value.trim().toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 64);
+}
+function sanitizeVariableKey(value) {
+  return value.trim().replace(/[^a-zA-Z0-9_.-]+/g, "_").slice(0, 80);
+}
+function isPlainObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+function assignKnown(target, source, keys) {
+  const writable = target;
+  for (const key of keys) {
+    if (source[key] !== void 0) {
+      writable[key] = source[key];
+    }
+  }
+}
+function sanitizeInteger(value, fallback, min, max) {
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+// src/frontend.ts
+var state;
+var roots = [];
+var ctxRef;
+var widgetCleanups = /* @__PURE__ */ new Map();
+function setup(ctx) {
+  ctxRef = ctx;
+  const removeStyle = ctx.dom.addStyle(STYLES);
+  const placement = createPlacement(ctx);
+  const settingsRoot = tryCreateSettingsRoot(ctx);
+  roots = uniqueRoots([placement.root, settingsRoot].filter((value) => !!value));
+  roots.forEach((root) => root.classList.add("tracktor-root"));
+  const openAction = ctx.ui?.registerInputBarAction?.({
+    id: "open-tracktor",
+    label: "Open Tracktor",
+    enabled: true,
+    iconSvg: TRACKTOR_SMALL_ICON
+  });
+  const unbindOpenAction = openAction?.onClick(() => {
+    placement.activate();
+    ctx.sendToBackend({ type: "get_state" });
+  });
+  const inputAction = ctx.ui?.registerInputBarAction?.({
+    id: "generate-latest-tracker",
+    label: "Generate Latest Tracker",
+    enabled: true,
+    iconSvg: TRACKTOR_SMALL_ICON
+  });
+  const unbindInputAction = inputAction?.onClick(() => {
+    ctx.sendToBackend({ type: "generate_tracker" });
+    placement.activate();
+  });
+  const unbindBackend = ctx.onBackendMessage((payload) => {
+    if (payload?.type === "state") {
+      state = payload.state;
+      placement.setBadge(state?.activeChat?.trackers.length ? String(state.activeChat.trackers.length) : null);
+      render();
+      renderMessageWidgets();
+    }
+  });
+  const unbindActivate = placement.onActivate(() => {
+    ctx.sendToBackend({ type: "get_state" });
+  });
+  roots.forEach((root) => {
+    root.addEventListener("click", handleClick);
+    root.addEventListener("change", handleChange);
+    root.addEventListener("input", handleInput);
+  });
+  ctx.sendToBackend({ type: "get_state" });
+  return () => {
+    roots.forEach((root) => {
+      root.removeEventListener("click", handleClick);
+      root.removeEventListener("change", handleChange);
+      root.removeEventListener("input", handleInput);
     });
-    const unbindOpenAction = openAction?.onClick(() => {
-        placement.activate();
-        ctx.sendToBackend({ type: 'get_state' });
-    });
-    const inputAction = ctx.ui?.registerInputBarAction?.({
-        id: 'generate-latest-tracker',
-        label: 'Generate Latest Tracker',
-        enabled: true,
-        iconSvg: TRACKTOR_SMALL_ICON,
-    });
-    const unbindInputAction = inputAction?.onClick(() => {
-        ctx.sendToBackend({ type: 'generate_tracker' });
-        placement.activate();
-    });
-    const unbindBackend = ctx.onBackendMessage((payload) => {
-        if (payload?.type === 'state') {
-            state = payload.state;
-            placement.setBadge(state?.activeChat?.trackers.length ? String(state.activeChat.trackers.length) : null);
-            render();
-            renderMessageWidgets();
-        }
-    });
-    const unbindActivate = placement.onActivate(() => {
-        ctx.sendToBackend({ type: 'get_state' });
-    });
-    root.addEventListener('click', handleClick);
-    root.addEventListener('change', handleChange);
-    root.addEventListener('input', handleInput);
-    ctx.sendToBackend({ type: 'get_state' });
-    return () => {
-        root.removeEventListener('click', handleClick);
-        root.removeEventListener('change', handleChange);
-        root.removeEventListener('input', handleInput);
-        for (const cleanup of widgetCleanups.values())
-            cleanup();
-        widgetCleanups.clear();
-        unbindInputAction?.();
-        inputAction?.destroy();
-        unbindOpenAction?.();
-        openAction?.destroy();
-        unbindActivate();
-        unbindBackend();
-        placement.destroy();
-        removeStyle();
-        ctx.dom.cleanup();
-    };
+    roots = [];
+    for (const cleanup of widgetCleanups.values()) cleanup();
+    widgetCleanups.clear();
+    unbindInputAction?.();
+    inputAction?.destroy();
+    unbindOpenAction?.();
+    openAction?.destroy();
+    unbindActivate();
+    unbindBackend();
+    placement.destroy();
+    removeStyle();
+    ctx.dom.cleanup();
+  };
 }
 function createPlacement(ctx) {
-    const drawerTab = tryCreateDrawerTab(ctx);
-    if (drawerTab) {
-        const cleanupLauncher = createFloatingLauncher(ctx, () => drawerTab.activate());
-        return {
-            root: drawerTab.root,
-            activate: drawerTab.activate,
-            setBadge(text) {
-                drawerTab.setBadge(text);
-                cleanupLauncher.setBadge(text);
-            },
-            onActivate: drawerTab.onActivate,
-            destroy() {
-                cleanupLauncher.destroy();
-                drawerTab.destroy();
-            },
-        };
-    }
-    return createFallbackPanel(ctx);
+  const drawerTab = tryCreateDrawerTab(ctx);
+  if (drawerTab) {
+    const cleanupLauncher = createFloatingLauncher(ctx, () => drawerTab.activate());
+    return {
+      root: drawerTab.root,
+      activate: drawerTab.activate,
+      setBadge(text) {
+        drawerTab.setBadge(text);
+        cleanupLauncher.setBadge(text);
+      },
+      onActivate: drawerTab.onActivate,
+      destroy() {
+        cleanupLauncher.destroy();
+        drawerTab.destroy();
+      }
+    };
+  }
+  return createFallbackPanel(ctx);
 }
 function tryCreateDrawerTab(ctx) {
-    if (typeof ctx.ui?.registerDrawerTab !== 'function') {
-        return undefined;
-    }
-    try {
-        const tab = ctx.ui.registerDrawerTab({
-            id: 'tracktor',
-            title: 'Tracktor',
-            shortName: 'Track',
-            headerTitle: 'Tracktor',
-            description: 'Generate and manage structured chat trackers',
-            keywords: ['tracker', 'state', 'schema', 'ztracker'],
-            iconSvg: TRACKTOR_ICON,
-        });
-        return {
-            root: tab.root,
-            activate: () => tab.activate(),
-            setBadge: (text) => tab.setBadge(text),
-            onActivate: (handler) => tab.onActivate(handler),
-            destroy: () => tab.destroy(),
-        };
-    }
-    catch (error) {
-        console.warn('Tracktor: drawer tab registration failed, falling back to a fixed launcher panel.', error);
-        return undefined;
-    }
+  if (typeof ctx.ui?.registerDrawerTab !== "function") {
+    return void 0;
+  }
+  try {
+    const tab = ctx.ui.registerDrawerTab({
+      id: "tracktor",
+      title: "Tracktor",
+      shortName: "Track",
+      headerTitle: "Tracktor",
+      description: "Generate and manage structured chat trackers",
+      keywords: ["tracker", "state", "schema", "ztracker"],
+      iconSvg: TRACKTOR_ICON
+    });
+    return {
+      root: tab.root,
+      activate: () => tab.activate(),
+      setBadge: (text) => tab.setBadge(text),
+      onActivate: (handler) => tab.onActivate(handler),
+      destroy: () => tab.destroy()
+    };
+  } catch (error) {
+    console.warn("Tracktor: drawer tab registration failed, falling back to a fixed launcher panel.", error);
+    return void 0;
+  }
 }
 function createFloatingLauncher(ctx, activate) {
-    const launcher = injectHostElement(ctx, 'body', `<button type="button" class="tracktor-floating-launcher" title="Open Tracktor">${TRACKTOR_SMALL_ICON}<span>Tracktor</span></button>`);
-    const button = launcher.matches('.tracktor-floating-launcher')
-        ? launcher
-        : launcher.querySelector('.tracktor-floating-launcher');
-    const onClick = () => {
-        activate();
-        ctx.sendToBackend({ type: 'get_state' });
-    };
-    button?.addEventListener('click', onClick);
-    return {
-        setBadge(text) {
-            if (!button)
-                return;
-            button.setAttribute('data-tracktor-badge', text ?? '');
-            button.classList.toggle('has-tracktor-badge', !!text);
-        },
-        destroy() {
-            button?.removeEventListener('click', onClick);
-            launcher.remove();
-        },
-    };
+  const launcher = injectHostElement(
+    ctx,
+    "body",
+    `<button type="button" class="tracktor-floating-launcher" title="Open Tracktor">${TRACKTOR_SMALL_ICON}<span>Tracktor</span></button>`
+  );
+  const button = launcher.matches(".tracktor-floating-launcher") ? launcher : launcher.querySelector(".tracktor-floating-launcher");
+  const onClick = () => {
+    activate();
+    ctx.sendToBackend({ type: "get_state" });
+  };
+  button?.addEventListener("click", onClick);
+  return {
+    setBadge(text) {
+      if (!button) return;
+      button.setAttribute("data-tracktor-badge", text ?? "");
+      button.classList.toggle("has-tracktor-badge", !!text);
+    },
+    destroy() {
+      button?.removeEventListener("click", onClick);
+      launcher.remove();
+    }
+  };
 }
 function createFallbackPanel(ctx) {
-    const shell = injectHostElement(ctx, 'body', `
+  const shell = injectHostElement(
+    ctx,
+    "body",
+    `
       <div class="tracktor-fallback-shell">
         <button type="button" class="tracktor-floating-launcher" title="Open Tracktor">${TRACKTOR_SMALL_ICON}<span>Tracktor</span></button>
         <aside class="tracktor-fallback-panel" aria-hidden="true">
@@ -144,116 +353,152 @@ function createFallbackPanel(ctx) {
           <div class="tracktor-fallback-body"></div>
         </aside>
       </div>
-    `);
-    const body = shell.querySelector('.tracktor-fallback-body');
-    const launcher = shell.querySelector('.tracktor-floating-launcher');
-    const close = shell.querySelector('.tracktor-fallback-close');
-    if (!body) {
-        throw new Error('Tracktor fallback panel failed to mount.');
+    `
+  );
+  const body = shell.querySelector(".tracktor-fallback-body");
+  const launcher = shell.querySelector(".tracktor-floating-launcher");
+  const close = shell.querySelector(".tracktor-fallback-close");
+  if (!body) {
+    throw new Error("Tracktor fallback panel failed to mount.");
+  }
+  const activateHandlers = /* @__PURE__ */ new Set();
+  const activate = () => {
+    shell.classList.add("is-open");
+    shell.querySelector(".tracktor-fallback-panel")?.setAttribute("aria-hidden", "false");
+    activateHandlers.forEach((handler) => handler());
+  };
+  const deactivate = () => {
+    shell.classList.remove("is-open");
+    shell.querySelector(".tracktor-fallback-panel")?.setAttribute("aria-hidden", "true");
+  };
+  launcher?.addEventListener("click", activate);
+  close?.addEventListener("click", deactivate);
+  return {
+    root: body,
+    activate,
+    setBadge(text) {
+      launcher?.setAttribute("data-tracktor-badge", text ?? "");
+      launcher?.classList.toggle("has-tracktor-badge", !!text);
+    },
+    onActivate(handler) {
+      activateHandlers.add(handler);
+      return () => activateHandlers.delete(handler);
+    },
+    destroy() {
+      launcher?.removeEventListener("click", activate);
+      close?.removeEventListener("click", deactivate);
+      shell.remove();
     }
-    const activateHandlers = new Set();
-    const activate = () => {
-        shell.classList.add('is-open');
-        shell.querySelector('.tracktor-fallback-panel')?.setAttribute('aria-hidden', 'false');
-        activateHandlers.forEach((handler) => handler());
-    };
-    const deactivate = () => {
-        shell.classList.remove('is-open');
-        shell.querySelector('.tracktor-fallback-panel')?.setAttribute('aria-hidden', 'true');
-    };
-    launcher?.addEventListener('click', activate);
-    close?.addEventListener('click', deactivate);
-    return {
-        root: body,
-        activate,
-        setBadge(text) {
-            launcher?.setAttribute('data-tracktor-badge', text ?? '');
-            launcher?.classList.toggle('has-tracktor-badge', !!text);
-        },
-        onActivate(handler) {
-            activateHandlers.add(handler);
-            return () => activateHandlers.delete(handler);
-        },
-        destroy() {
-            launcher?.removeEventListener('click', activate);
-            close?.removeEventListener('click', deactivate);
-            shell.remove();
-        },
-    };
+  };
 }
-function injectHostElement(ctx, target, html) {
-    if (typeof ctx.dom.inject === 'function') {
-        return ctx.dom.inject(target, html);
+function tryCreateSettingsRoot(ctx) {
+  if (typeof ctx.ui?.mount !== "function") {
+    return void 0;
+  }
+  try {
+    const mount = ctx.ui.mount("settings_extensions");
+    mount.querySelector("[data-tracktor-settings-root]")?.remove();
+    return injectHostElement(
+      ctx,
+      mount,
+      '<section class="tracktor-settings-surface" data-tracktor-settings-root></section>'
+    );
+  } catch (error) {
+    console.warn("Tracktor: extension settings mount failed.", error);
+    return void 0;
+  }
+}
+function uniqueRoots(values) {
+  const seen = /* @__PURE__ */ new Set();
+  const unique = [];
+  for (const value of values) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    unique.push(value);
+  }
+  return unique;
+}
+function injectHostElement(ctx, target, html, position = "beforeend") {
+  if (typeof ctx.dom.inject === "function") {
+    try {
+      return ctx.dom.inject(target, html, position);
+    } catch (error) {
+      if (typeof target === "string") throw error;
+      console.warn("Tracktor: DOM helper rejected an Element target, using direct host insertion.", error);
     }
-    const template = document.createElement('template');
-    template.innerHTML = html.trim();
-    const element = template.content.firstElementChild;
-    if (!element) {
-        throw new Error('Tracktor failed to create host element.');
-    }
-    document.querySelector(target)?.appendChild(element);
-    return element;
+  }
+  const template = document.createElement("template");
+  template.innerHTML = html.trim();
+  const element = template.content.firstElementChild;
+  if (!element) {
+    throw new Error("Tracktor failed to create host element.");
+  }
+  const parent = typeof target === "string" ? document.querySelector(target) : target;
+  if (!parent) {
+    throw new Error("Tracktor failed to find a host mount point.");
+  }
+  parent.insertAdjacentElement(position, element);
+  return element;
 }
 function render() {
-    if (!root)
-        return;
+  if (roots.length === 0) return;
+  for (const root of roots) {
     if (!state) {
-        root.innerHTML = '<div class="tracktor-empty">Loading Tracktor...</div>';
-        return;
+      root.innerHTML = '<div class="tracktor-empty">Loading Tracktor...</div>';
+      continue;
     }
     root.innerHTML = `
-    <div class="tracktor-shell">
-      ${renderStatus(state)}
-      ${renderToolbar(state)}
-      ${renderTrackers(state)}
-      ${renderSettings(state.settings)}
-      ${renderSchemaEditor(state.settings)}
-    </div>
-  `;
+      <div class="tracktor-shell">
+        ${renderStatus(state)}
+        ${renderToolbar(state)}
+        ${renderTrackers(state)}
+        ${renderSettings(state.settings)}
+        ${renderSchemaEditor(state.settings)}
+      </div>
+    `;
+  }
 }
 function renderStatus(current) {
-    const warnings = current.permissionWarnings.length
-        ? `<div class="tracktor-warning">Grant permissions in Lumiverse Extensions: ${current.permissionWarnings.map(escapeHtml).join(', ')}</div>`
-        : '';
-    const error = current.lastError ? `<div class="tracktor-error">${escapeHtml(current.lastError)}</div>` : '';
-    const busy = current.busy ? '<div class="tracktor-busy">Working...</div>' : '';
-    return `${warnings}${error}${busy}`;
+  const warnings = current.permissionWarnings.length ? `<div class="tracktor-warning">Grant permissions in Lumiverse Extensions: ${current.permissionWarnings.map(escapeHtml).join(", ")}</div>` : "";
+  const error = current.lastError ? `<div class="tracktor-error">${escapeHtml(current.lastError)}</div>` : "";
+  const busy = current.busy ? '<div class="tracktor-busy">Working...</div>' : "";
+  return `${warnings}${error}${busy}`;
 }
 function renderToolbar(current) {
-    const chat = current.activeChat;
-    return `
+  const chat = current.activeChat;
+  return `
     <section class="tracktor-section tracktor-toolbar">
       <div>
-        <strong>${escapeHtml(chat?.name ?? 'No active chat')}</strong>
-        <span>${chat ? `${chat.messageCount} messages, ${chat.trackers.length} trackers` : 'Open a chat to generate trackers.'}</span>
+        <strong>${escapeHtml(chat?.name ?? "No active chat")}</strong>
+        <span>${chat ? `${chat.messageCount} messages, ${chat.trackers.length} trackers` : "Open a chat to generate trackers."}</span>
       </div>
       <div class="tracktor-actions">
         <button type="button" data-action="refresh">Refresh</button>
-        <button type="button" data-action="generate-latest" ${chat && !current.busy ? '' : 'disabled'}>Generate Latest</button>
-        <button type="button" data-action="generate-latest-sequential" ${chat && !current.busy ? '' : 'disabled'}>Generate Sequential</button>
+        <button type="button" data-action="generate-latest" ${chat && !current.busy ? "" : "disabled"}>Generate Tracker</button>
+        <button type="button" data-action="generate-latest-sequential" ${chat && !current.busy ? "" : "disabled"}>Generate Sequential</button>
       </div>
     </section>
   `;
 }
 function renderTrackers(current) {
-    const trackers = current.activeChat?.trackers ?? [];
-    if (!current.activeChat) {
-        return '<section class="tracktor-section"><h2>Trackers</h2><div class="tracktor-empty">No active chat.</div></section>';
-    }
-    if (trackers.length === 0) {
-        return '<section class="tracktor-section"><h2>Trackers</h2><div class="tracktor-empty">No trackers yet. Generate one for the latest message to get started.</div></section>';
-    }
-    return `
+  const trackers = current.activeChat?.trackers ?? [];
+  if (!current.activeChat) {
+    return '<section class="tracktor-section"><h2>Trackers</h2><div class="tracktor-empty">No active chat.</div></section>';
+  }
+  if (trackers.length === 0) {
+    return '<section class="tracktor-section"><h2>Trackers</h2><div class="tracktor-empty">No trackers yet. Generate one for the latest message to get started.</div></section>';
+  }
+  return `
     <section class="tracktor-section">
       <h2>Trackers</h2>
       <div class="tracktor-list">
-        ${trackers.map(renderTrackerItem).join('')}
+        ${trackers.map(renderTrackerItem).join("")}
       </div>
     </section>
   `;
 }
 function renderTrackerItem(item) {
-    return `
+  return `
     <article class="tracktor-item" data-chat-id="${escapeHtml(item.chatId)}" data-message-id="${escapeHtml(item.messageId)}">
       <div class="tracktor-item-head">
         <div>
@@ -271,21 +516,21 @@ function renderTrackerItem(item) {
   `;
 }
 function renderSettings(settings) {
-    return `
+  return `
     <section class="tracktor-section">
       <h2>Settings</h2>
       <div class="tracktor-form-grid">
         <label>Generation mode
           <select data-setting="generationMode">
-            <option value="json" ${settings.generationMode === 'json' ? 'selected' : ''}>Prompted JSON</option>
-            <option value="native_json" ${settings.generationMode === 'native_json' ? 'selected' : ''}>Native JSON schema</option>
+            <option value="json" ${settings.generationMode === "json" ? "selected" : ""}>Prompted JSON</option>
+            <option value="native_json" ${settings.generationMode === "native_json" ? "selected" : ""}>Native JSON schema</option>
           </select>
         </label>
         <label>Auto mode
           <select data-setting="autoMode">
-            <option value="off" ${settings.autoMode === 'off' ? 'selected' : ''}>Off</option>
-            <option value="assistant_message" ${settings.autoMode === 'assistant_message' ? 'selected' : ''}>After assistant messages</option>
-            <option value="user_message" ${settings.autoMode === 'user_message' ? 'selected' : ''}>After user messages</option>
+            <option value="off" ${settings.autoMode === "off" ? "selected" : ""}>Off</option>
+            <option value="assistant_message" ${settings.autoMode === "assistant_message" ? "selected" : ""}>After assistant messages</option>
+            <option value="user_message" ${settings.autoMode === "user_message" ? "selected" : ""}>After user messages</option>
           </select>
         </label>
         <label>Recent messages
@@ -298,11 +543,11 @@ function renderSettings(settings) {
           <input data-setting="maxResponseTokens" type="number" min="1" max="64000" value="${settings.maxResponseTokens}">
         </label>
         <label class="tracktor-check">
-          <input data-setting="sequentialPartGeneration" type="checkbox" ${settings.sequentialPartGeneration ? 'checked' : ''}>
+          <input data-setting="sequentialPartGeneration" type="checkbox" ${settings.sequentialPartGeneration ? "checked" : ""}>
           Sequential part generation
         </label>
         <label class="tracktor-check">
-          <input data-setting="injection.enabled" type="checkbox" ${settings.injection.enabled ? 'checked' : ''}>
+          <input data-setting="injection.enabled" type="checkbox" ${settings.injection.enabled ? "checked" : ""}>
           Inject snapshots into normal generations
         </label>
         <label>Injected snapshots
@@ -310,9 +555,9 @@ function renderSettings(settings) {
         </label>
         <label>Injection role
           <select data-setting="injection.role">
-            <option value="system" ${settings.injection.role === 'system' ? 'selected' : ''}>System</option>
-            <option value="user" ${settings.injection.role === 'user' ? 'selected' : ''}>User</option>
-            <option value="assistant" ${settings.injection.role === 'assistant' ? 'selected' : ''}>Assistant</option>
+            <option value="system" ${settings.injection.role === "system" ? "selected" : ""}>System</option>
+            <option value="user" ${settings.injection.role === "user" ? "selected" : ""}>User</option>
+            <option value="assistant" ${settings.injection.role === "assistant" ? "selected" : ""}>Assistant</option>
           </select>
         </label>
         <label>Chat variable key
@@ -327,20 +572,21 @@ function renderSettings(settings) {
       </label>
       <div class="tracktor-actions">
         <button type="button" data-action="save-settings">Save Settings</button>
+        <button type="button" data-action="restore-default-prompts">Restore Built-in Tracker Prompt</button>
       </div>
     </section>
   `;
 }
 function renderSchemaEditor(settings) {
-    const presets = Object.values(settings.schemaPresets);
-    const active = settings.schemaPresets[settings.activeSchemaId] ?? presets[0];
-    return `
+  const presets = Object.values(settings.schemaPresets);
+  const active = settings.schemaPresets[settings.activeSchemaId] ?? presets[0];
+  return `
     <section class="tracktor-section">
       <h2>Schema</h2>
       <div class="tracktor-form-grid">
         <label>Active preset
           <select data-setting="activeSchemaId">
-            ${presets.map((preset) => `<option value="${escapeHtml(preset.id)}" ${preset.id === active.id ? 'selected' : ''}>${escapeHtml(preset.name)}</option>`).join('')}
+            ${presets.map((preset) => `<option value="${escapeHtml(preset.id)}" ${preset.id === active.id ? "selected" : ""}>${escapeHtml(preset.name)}</option>`).join("")}
           </select>
         </label>
         <label>Preset id
@@ -358,134 +604,124 @@ function renderSchemaEditor(settings) {
       </label>
       <div class="tracktor-actions">
         <button type="button" data-action="save-schema">Save Schema Preset</button>
-        <button type="button" data-action="use-schema-for-chat" ${state?.activeChat ? '' : 'disabled'}>Use For This Chat</button>
+        <button type="button" data-action="use-schema-for-chat" ${state?.activeChat ? "" : "disabled"}>Use For This Chat</button>
       </div>
     </section>
   `;
 }
 function handleClick(event) {
-    const target = event.target;
-    const button = target?.closest('[data-action]');
-    if (!button || !state)
-        return;
-    const action = button.dataset.action;
-    if (action === 'refresh') {
-        ctxRef.sendToBackend({ type: 'get_state' });
-    }
-    else if (action === 'generate-latest') {
-        ctxRef.sendToBackend({ type: 'generate_tracker', chatId: state.activeChat?.id });
-    }
-    else if (action === 'generate-latest-sequential') {
-        ctxRef.sendToBackend({ type: 'generate_tracker', chatId: state.activeChat?.id, sequential: true });
-    }
-    else if (action === 'regenerate') {
-        ctxRef.sendToBackend({ type: 'generate_tracker', chatId: button.dataset.chatId, messageId: button.dataset.messageId });
-    }
-    else if (action === 'edit') {
-        openEditModal(button.dataset.chatId, button.dataset.messageId);
-    }
-    else if (action === 'delete') {
-        void confirmDelete(button.dataset.chatId, button.dataset.messageId);
-    }
-    else if (action === 'save-settings') {
-        saveSettingsFromDom();
-    }
-    else if (action === 'save-schema') {
-        saveSchemaFromDom();
-    }
-    else if (action === 'use-schema-for-chat') {
-        ctxRef.sendToBackend({
-            type: 'set_chat_schema',
-            chatId: state.activeChat?.id,
-            schemaId: state.settings.activeSchemaId,
-        });
-    }
+  const target = event.target;
+  const button = target?.closest("[data-action]");
+  if (!button || !state) return;
+  const action = button.dataset.action;
+  if (action === "refresh") {
+    ctxRef.sendToBackend({ type: "get_state" });
+  } else if (action === "generate-latest") {
+    ctxRef.sendToBackend({ type: "generate_tracker", chatId: state.activeChat?.id });
+  } else if (action === "generate-latest-sequential") {
+    ctxRef.sendToBackend({ type: "generate_tracker", chatId: state.activeChat?.id, sequential: true });
+  } else if (action === "regenerate") {
+    ctxRef.sendToBackend({ type: "generate_tracker", chatId: button.dataset.chatId, messageId: button.dataset.messageId });
+  } else if (action === "edit") {
+    openEditModal(button.dataset.chatId, button.dataset.messageId);
+  } else if (action === "delete") {
+    void confirmDelete(button.dataset.chatId, button.dataset.messageId);
+  } else if (action === "save-settings") {
+    saveSettingsFromDom();
+  } else if (action === "restore-default-prompts") {
+    restoreDefaultPrompts();
+  } else if (action === "save-schema") {
+    saveSchemaFromDom(getRootForAction(button));
+  } else if (action === "use-schema-for-chat") {
+    ctxRef.sendToBackend({
+      type: "set_chat_schema",
+      chatId: state.activeChat?.id,
+      schemaId: state.settings.activeSchemaId
+    });
+  }
 }
 function handleChange(event) {
-    const target = event.target;
-    if (!target?.dataset.setting || !state)
-        return;
-    applySettingValue(target);
-    render();
+  const target = event.target;
+  if (!target?.dataset.setting || !state) return;
+  applySettingValue(target);
+  render();
 }
 function handleInput(event) {
-    const target = event.target;
-    if (!target?.dataset.setting || !state)
-        return;
-    applySettingValue(target);
+  const target = event.target;
+  if (!target?.dataset.setting || !state) return;
+  applySettingValue(target);
 }
 function applySettingValue(target) {
-    if (!state)
-        return;
-    const settings = state.settings;
-    const path = target.dataset.setting.split('.');
-    let owner = settings;
-    for (const part of path.slice(0, -1)) {
-        owner = owner[part];
-    }
-    const key = path[path.length - 1];
-    if (target instanceof HTMLInputElement && target.type === 'checkbox') {
-        owner[key] = target.checked;
-    }
-    else if (target instanceof HTMLInputElement && target.type === 'number') {
-        owner[key] = Number.parseInt(target.value, 10);
-    }
-    else {
-        owner[key] = target.value;
-    }
+  if (!state) return;
+  const settings = state.settings;
+  const path = target.dataset.setting.split(".");
+  let owner = settings;
+  for (const part of path.slice(0, -1)) {
+    owner = owner[part];
+  }
+  const key = path[path.length - 1];
+  if (target instanceof HTMLInputElement && target.type === "checkbox") {
+    owner[key] = target.checked;
+  } else if (target instanceof HTMLInputElement && target.type === "number") {
+    owner[key] = Number.parseInt(target.value, 10);
+  } else {
+    owner[key] = target.value;
+  }
 }
 function saveSettingsFromDom() {
-    if (!state)
-        return;
-    ctxRef.sendToBackend({ type: 'save_settings', settings: deepMergeSettings(state.settings) });
+  if (!state) return;
+  ctxRef.sendToBackend({ type: "save_settings", settings: deepMergeSettings(state.settings) });
 }
-function saveSchemaFromDom() {
-    if (!state)
-        return;
-    const idInput = root.querySelector('[data-schema-field="id"]');
-    const nameInput = root.querySelector('[data-schema-field="name"]');
-    const schemaInput = root.querySelector('[data-schema-field="schema"]');
-    const templateInput = root.querySelector('[data-schema-field="templateHtml"]');
-    if (!idInput || !nameInput || !schemaInput || !templateInput)
-        return;
-    try {
-        const id = sanitizeId(idInput.value) || 'schema';
-        const schema = JSON.parse(schemaInput.value);
-        const settings = structuredClone(state.settings);
-        settings.schemaPresets[id] = {
-            id,
-            name: nameInput.value.trim() || id,
-            schema,
-            templateHtml: templateInput.value,
-        };
-        settings.activeSchemaId = id;
-        ctxRef.sendToBackend({ type: 'save_settings', settings });
-    }
-    catch (error) {
-        showErrorModal(error instanceof Error ? error.message : String(error));
-    }
+function restoreDefaultPrompts() {
+  if (!state) return;
+  state.settings.systemPrompt = DEFAULT_SYSTEM_PROMPT;
+  state.settings.extractionPrompt = DEFAULT_EXTRACTION_PROMPT;
+  ctxRef.sendToBackend({ type: "save_settings", settings: deepMergeSettings(state.settings) });
+  render();
+}
+function saveSchemaFromDom(sourceRoot) {
+  if (!state) return;
+  const idInput = sourceRoot.querySelector('[data-schema-field="id"]');
+  const nameInput = sourceRoot.querySelector('[data-schema-field="name"]');
+  const schemaInput = sourceRoot.querySelector('[data-schema-field="schema"]');
+  const templateInput = sourceRoot.querySelector('[data-schema-field="templateHtml"]');
+  if (!idInput || !nameInput || !schemaInput || !templateInput) return;
+  try {
+    const id = sanitizeId(idInput.value) || "schema";
+    const schema = JSON.parse(schemaInput.value);
+    const settings = structuredClone(state.settings);
+    settings.schemaPresets[id] = {
+      id,
+      name: nameInput.value.trim() || id,
+      schema,
+      templateHtml: templateInput.value
+    };
+    settings.activeSchemaId = id;
+    ctxRef.sendToBackend({ type: "save_settings", settings });
+  } catch (error) {
+    showErrorModal(error instanceof Error ? error.message : String(error));
+  }
+}
+function getRootForAction(button) {
+  return button.closest(".tracktor-root") ?? roots[0];
 }
 function openEditModal(chatId, messageId) {
-    if (!state || !chatId || !messageId)
-        return;
-    const tracker = state.activeChat?.trackers.find((item) => item.chatId === chatId && item.messageId === messageId);
-    if (!tracker)
-        return;
-    if (typeof ctxRef.ui?.showModal !== 'function') {
-        const next = window.prompt('Edit tracker JSON', JSON.stringify(tracker.tracker.data, null, 2));
-        if (next === null)
-            return;
-        try {
-            JSON.parse(next);
-            ctxRef.sendToBackend({ type: 'update_tracker', chatId, messageId, data: next });
-        }
-        catch (error) {
-            showErrorModal(error instanceof Error ? error.message : String(error));
-        }
-        return;
+  if (!state || !chatId || !messageId) return;
+  const tracker = state.activeChat?.trackers.find((item) => item.chatId === chatId && item.messageId === messageId);
+  if (!tracker) return;
+  if (typeof ctxRef.ui?.showModal !== "function") {
+    const next = window.prompt("Edit tracker JSON", JSON.stringify(tracker.tracker.data, null, 2));
+    if (next === null) return;
+    try {
+      JSON.parse(next);
+      ctxRef.sendToBackend({ type: "update_tracker", chatId, messageId, data: next });
+    } catch (error) {
+      showErrorModal(error instanceof Error ? error.message : String(error));
     }
-    const modal = ctxRef.ui.showModal({ title: 'Edit Tracker JSON', width: 720, maxHeight: 720 });
-    modal.root.innerHTML = `
+    return;
+  }
+  const modal = ctxRef.ui.showModal({ title: "Edit Tracker JSON", width: 720, maxHeight: 720 });
+  modal.root.innerHTML = `
     <div class="tracktor-modal-body">
       <textarea class="tracktor-json-editor" spellcheck="false">${escapeHtml(JSON.stringify(tracker.tracker.data, null, 2))}</textarea>
       <div class="tracktor-actions">
@@ -494,87 +730,81 @@ function openEditModal(chatId, messageId) {
       </div>
     </div>
   `;
-    modal.root.addEventListener('click', (event) => {
-        const action = event.target?.closest('[data-modal-action]');
-        if (!action)
-            return;
-        if (action.dataset.modalAction === 'cancel') {
-            modal.dismiss();
-            return;
-        }
-        const textarea = modal.root.querySelector('.tracktor-json-editor');
-        if (!textarea)
-            return;
-        try {
-            JSON.parse(textarea.value);
-            ctxRef.sendToBackend({ type: 'update_tracker', chatId, messageId, data: textarea.value });
-            modal.dismiss();
-        }
-        catch (error) {
-            showErrorModal(error instanceof Error ? error.message : String(error));
-        }
-    });
+  modal.root.addEventListener("click", (event) => {
+    const action = event.target?.closest("[data-modal-action]");
+    if (!action) return;
+    if (action.dataset.modalAction === "cancel") {
+      modal.dismiss();
+      return;
+    }
+    const textarea = modal.root.querySelector(".tracktor-json-editor");
+    if (!textarea) return;
+    try {
+      JSON.parse(textarea.value);
+      ctxRef.sendToBackend({ type: "update_tracker", chatId, messageId, data: textarea.value });
+      modal.dismiss();
+    } catch (error) {
+      showErrorModal(error instanceof Error ? error.message : String(error));
+    }
+  });
 }
 async function confirmDelete(chatId, messageId) {
-    if (!chatId || !messageId)
-        return;
-    const { confirmed } = typeof ctxRef.ui?.showConfirm === 'function'
-        ? await ctxRef.ui.showConfirm({
-            title: 'Delete Tracker',
-            message: 'Delete tracker data from this message?',
-            variant: 'danger',
-            confirmLabel: 'Delete',
-        })
-        : { confirmed: window.confirm('Delete tracker data from this message?') };
-    if (confirmed) {
-        ctxRef.sendToBackend({ type: 'delete_tracker', chatId, messageId });
-    }
+  if (!chatId || !messageId) return;
+  const { confirmed } = typeof ctxRef.ui?.showConfirm === "function" ? await ctxRef.ui.showConfirm({
+    title: "Delete Tracker",
+    message: "Delete tracker data from this message?",
+    variant: "danger",
+    confirmLabel: "Delete"
+  }) : { confirmed: window.confirm("Delete tracker data from this message?") };
+  if (confirmed) {
+    ctxRef.sendToBackend({ type: "delete_tracker", chatId, messageId });
+  }
 }
 function showErrorModal(message) {
-    if (typeof ctxRef.ui?.showModal !== 'function') {
-        window.alert(`Tracktor Error: ${message}`);
-        return;
-    }
-    const modal = ctxRef.ui.showModal({ title: 'Tracktor Error', width: 420, maxHeight: 320 });
-    modal.root.innerHTML = `<p class="tracktor-error-text">${escapeHtml(message)}</p>`;
+  if (typeof ctxRef.ui?.showModal !== "function") {
+    window.alert(`Tracktor Error: ${message}`);
+    return;
+  }
+  const modal = ctxRef.ui.showModal({ title: "Tracktor Error", width: 420, maxHeight: 320 });
+  modal.root.innerHTML = `<p class="tracktor-error-text">${escapeHtml(message)}</p>`;
 }
 function renderMessageWidgets() {
-    if (!ctxRef.messages || !state?.activeChat)
-        return;
-    const activeIds = new Set(state.activeChat.trackers.map((item) => item.messageId));
-    for (const [messageId, cleanup] of widgetCleanups.entries()) {
-        if (!activeIds.has(messageId)) {
-            cleanup();
-            widgetCleanups.delete(messageId);
-        }
+  if (!ctxRef.messages || !state?.activeChat) return;
+  const activeIds = new Set(state.activeChat.trackers.map((item) => item.messageId));
+  for (const [messageId, cleanup] of widgetCleanups.entries()) {
+    if (!activeIds.has(messageId)) {
+      cleanup();
+      widgetCleanups.delete(messageId);
     }
-    for (const tracker of state.activeChat.trackers) {
-        const existing = widgetCleanups.get(tracker.messageId);
-        if (existing) {
-            existing();
-            widgetCleanups.delete(tracker.messageId);
-        }
-        const cleanup = ctxRef.messages.renderWidget({
-            messageId: tracker.messageId,
-            widgetId: 'tracktor-tracker',
-            html: buildWidgetHtml(tracker),
-        }, (message) => {
-            if (message?.type === 'regenerate') {
-                ctxRef.sendToBackend({ type: 'generate_tracker', chatId: tracker.chatId, messageId: tracker.messageId });
-            }
-            else if (message?.type === 'edit') {
-                openEditModal(tracker.chatId, tracker.messageId);
-            }
-            else if (message?.type === 'delete') {
-                void confirmDelete(tracker.chatId, tracker.messageId);
-            }
-        });
-        widgetCleanups.set(tracker.messageId, cleanup);
+  }
+  for (const tracker of state.activeChat.trackers) {
+    const existing = widgetCleanups.get(tracker.messageId);
+    if (existing) {
+      existing();
+      widgetCleanups.delete(tracker.messageId);
     }
+    const cleanup = ctxRef.messages.renderWidget(
+      {
+        messageId: tracker.messageId,
+        widgetId: "tracktor-tracker",
+        html: buildWidgetHtml(tracker)
+      },
+      (message) => {
+        if (message?.type === "regenerate") {
+          ctxRef.sendToBackend({ type: "generate_tracker", chatId: tracker.chatId, messageId: tracker.messageId });
+        } else if (message?.type === "edit") {
+          openEditModal(tracker.chatId, tracker.messageId);
+        } else if (message?.type === "delete") {
+          void confirmDelete(tracker.chatId, tracker.messageId);
+        }
+      }
+    );
+    widgetCleanups.set(tracker.messageId, cleanup);
+  }
 }
 function buildWidgetHtml(item) {
-    const rendered = stripDangerousHtml(item.tracker.renderedHtml);
-    return `
+  const rendered = stripDangerousHtml(item.tracker.renderedHtml);
+  return `
     <style>
       body { margin: 0; color: var(--lumiverse-text, #e8e8e8); font: 13px/1.45 system-ui, sans-serif; }
       .wrap { border: 1px solid var(--lumiverse-border, #444); background: var(--lumiverse-fill-subtle, #1f1f1f); border-radius: 8px; padding: 10px; }
@@ -614,13 +844,17 @@ function buildWidgetHtml(item) {
         window.spindleSandbox.postMessage({ type: button.getAttribute('data-action') });
       });
       window.spindleSandbox.requestResize();
-    </script>
+    <\/script>
   `;
 }
-const TRACKTOR_ICON = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M4 5h11a3 3 0 0 1 3 3v1h1.2a2 2 0 0 1 1.8 1.1l1 2V17h-2.1a3 3 0 0 1-5.8 0H10a3 3 0 0 1-5.8 0H2V7a2 2 0 0 1 2-2Zm0 2v8h.8a3 3 0 0 1 4.4 0H14V8a1 1 0 0 0-1-1H4Zm12 4v4h.8a3 3 0 0 1 1.6-.8h1.6v-1.7l-.7-1.5H16ZM7 18a1 1 0 1 0 0-2 1 1 0 0 0 0 2Zm10 0a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z"/></svg>';
-const TRACKTOR_SMALL_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M4 5h11a3 3 0 0 1 3 3v1h1.2a2 2 0 0 1 1.8 1.1l1 2V17h-2.1a3 3 0 0 1-5.8 0H10a3 3 0 0 1-5.8 0H2V7a2 2 0 0 1 2-2Z"/></svg>';
-const STYLES = `
+var TRACKTOR_ICON = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M4 5h11a3 3 0 0 1 3 3v1h1.2a2 2 0 0 1 1.8 1.1l1 2V17h-2.1a3 3 0 0 1-5.8 0H10a3 3 0 0 1-5.8 0H2V7a2 2 0 0 1 2-2Zm0 2v8h.8a3 3 0 0 1 4.4 0H14V8a1 1 0 0 0-1-1H4Zm12 4v4h.8a3 3 0 0 1 1.6-.8h1.6v-1.7l-.7-1.5H16ZM7 18a1 1 0 1 0 0-2 1 1 0 0 0 0 2Zm10 0a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z"/></svg>';
+var TRACKTOR_SMALL_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M4 5h11a3 3 0 0 1 3 3v1h1.2a2 2 0 0 1 1.8 1.1l1 2V17h-2.1a3 3 0 0 1-5.8 0H10a3 3 0 0 1-5.8 0H2V7a2 2 0 0 1 2-2Z"/></svg>';
+var STYLES = `
   .tracktor-root { height: 100%; overflow: auto; color: var(--lumiverse-text); }
+  .tracktor-settings-surface {
+    min-height: 0;
+    padding-block: 8px;
+  }
   .tracktor-floating-launcher {
     position: fixed;
     right: 16px;
@@ -737,3 +971,6 @@ const STYLES = `
     .tracktor-form-grid, .tracktor-grid { grid-template-columns: 1fr; }
   }
 `;
+export {
+  setup
+};

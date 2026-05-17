@@ -2,6 +2,8 @@ import {
   type FrontendState,
   type TrackerSummary,
   type TracktorSettings,
+  DEFAULT_EXTRACTION_PROMPT,
+  DEFAULT_SYSTEM_PROMPT,
   deepMergeSettings,
   escapeHtml,
   safePreview,
@@ -12,10 +14,11 @@ import {
 type SpindleFrontendContext = {
   dom: {
     addStyle(css: string): () => void;
-    inject?(target: string, html: string, position?: InsertPosition): HTMLElement;
+    inject?(target: string | Element, html: string, position?: InsertPosition): HTMLElement;
     cleanup(): void;
   };
   ui?: {
+    mount?(slot: string): HTMLElement;
     registerDrawerTab(options: Record<string, unknown>): {
       root: HTMLElement;
       activate(): void;
@@ -47,7 +50,7 @@ type SpindleFrontendContext = {
 };
 
 let state: FrontendState | undefined;
-let root: HTMLElement;
+let roots: HTMLElement[] = [];
 let ctxRef: SpindleFrontendContext;
 const widgetCleanups = new Map<string, () => void>();
 
@@ -55,8 +58,9 @@ export function setup(ctx: SpindleFrontendContext) {
   ctxRef = ctx;
   const removeStyle = ctx.dom.addStyle(STYLES);
   const placement = createPlacement(ctx);
-  root = placement.root;
-  root.classList.add('tracktor-root');
+  const settingsRoot = tryCreateSettingsRoot(ctx);
+  roots = uniqueRoots([placement.root, settingsRoot].filter((value): value is HTMLElement => !!value));
+  roots.forEach((root) => root.classList.add('tracktor-root'));
 
   const openAction = ctx.ui?.registerInputBarAction?.({
     id: 'open-tracktor',
@@ -93,16 +97,21 @@ export function setup(ctx: SpindleFrontendContext) {
     ctx.sendToBackend({ type: 'get_state' });
   });
 
-  root.addEventListener('click', handleClick);
-  root.addEventListener('change', handleChange);
-  root.addEventListener('input', handleInput);
+  roots.forEach((root) => {
+    root.addEventListener('click', handleClick);
+    root.addEventListener('change', handleChange);
+    root.addEventListener('input', handleInput);
+  });
 
   ctx.sendToBackend({ type: 'get_state' });
 
   return () => {
-    root.removeEventListener('click', handleClick);
-    root.removeEventListener('change', handleChange);
-    root.removeEventListener('input', handleInput);
+    roots.forEach((root) => {
+      root.removeEventListener('click', handleClick);
+      root.removeEventListener('change', handleChange);
+      root.removeEventListener('input', handleInput);
+    });
+    roots = [];
     for (const cleanup of widgetCleanups.values()) cleanup();
     widgetCleanups.clear();
     unbindInputAction?.();
@@ -261,9 +270,49 @@ function createFallbackPanel(ctx: SpindleFrontendContext): TracktorPlacement {
   };
 }
 
-function injectHostElement(ctx: SpindleFrontendContext, target: string, html: string): HTMLElement {
+function tryCreateSettingsRoot(ctx: SpindleFrontendContext): HTMLElement | undefined {
+  if (typeof ctx.ui?.mount !== 'function') {
+    return undefined;
+  }
+
+  try {
+    const mount = ctx.ui.mount('settings_extensions');
+    mount.querySelector('[data-tracktor-settings-root]')?.remove();
+    return injectHostElement(
+      ctx,
+      mount,
+      '<section class="tracktor-settings-surface" data-tracktor-settings-root></section>',
+    );
+  } catch (error) {
+    console.warn('Tracktor: extension settings mount failed.', error);
+    return undefined;
+  }
+}
+
+function uniqueRoots(values: HTMLElement[]): HTMLElement[] {
+  const seen = new Set<HTMLElement>();
+  const unique: HTMLElement[] = [];
+  for (const value of values) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    unique.push(value);
+  }
+  return unique;
+}
+
+function injectHostElement(
+  ctx: SpindleFrontendContext,
+  target: string | Element,
+  html: string,
+  position: InsertPosition = 'beforeend',
+): HTMLElement {
   if (typeof ctx.dom.inject === 'function') {
-    return ctx.dom.inject(target, html);
+    try {
+      return ctx.dom.inject(target, html, position);
+    } catch (error) {
+      if (typeof target === 'string') throw error;
+      console.warn('Tracktor: DOM helper rejected an Element target, using direct host insertion.', error);
+    }
   }
 
   const template = document.createElement('template');
@@ -272,26 +321,32 @@ function injectHostElement(ctx: SpindleFrontendContext, target: string, html: st
   if (!element) {
     throw new Error('Tracktor failed to create host element.');
   }
-  document.querySelector(target)?.appendChild(element);
+  const parent = typeof target === 'string' ? document.querySelector(target) : target;
+  if (!parent) {
+    throw new Error('Tracktor failed to find a host mount point.');
+  }
+  parent.insertAdjacentElement(position, element);
   return element;
 }
 
 function render(): void {
-  if (!root) return;
-  if (!state) {
-    root.innerHTML = '<div class="tracktor-empty">Loading Tracktor...</div>';
-    return;
-  }
+  if (roots.length === 0) return;
+  for (const root of roots) {
+    if (!state) {
+      root.innerHTML = '<div class="tracktor-empty">Loading Tracktor...</div>';
+      continue;
+    }
 
-  root.innerHTML = `
-    <div class="tracktor-shell">
-      ${renderStatus(state)}
-      ${renderToolbar(state)}
-      ${renderTrackers(state)}
-      ${renderSettings(state.settings)}
-      ${renderSchemaEditor(state.settings)}
-    </div>
-  `;
+    root.innerHTML = `
+      <div class="tracktor-shell">
+        ${renderStatus(state)}
+        ${renderToolbar(state)}
+        ${renderTrackers(state)}
+        ${renderSettings(state.settings)}
+        ${renderSchemaEditor(state.settings)}
+      </div>
+    `;
+  }
 }
 
 function renderStatus(current: FrontendState): string {
@@ -313,7 +368,7 @@ function renderToolbar(current: FrontendState): string {
       </div>
       <div class="tracktor-actions">
         <button type="button" data-action="refresh">Refresh</button>
-        <button type="button" data-action="generate-latest" ${chat && !current.busy ? '' : 'disabled'}>Generate Latest</button>
+        <button type="button" data-action="generate-latest" ${chat && !current.busy ? '' : 'disabled'}>Generate Tracker</button>
         <button type="button" data-action="generate-latest-sequential" ${chat && !current.busy ? '' : 'disabled'}>Generate Sequential</button>
       </div>
     </section>
@@ -415,6 +470,7 @@ function renderSettings(settings: TracktorSettings): string {
       </label>
       <div class="tracktor-actions">
         <button type="button" data-action="save-settings">Save Settings</button>
+        <button type="button" data-action="restore-default-prompts">Restore Built-in Tracker Prompt</button>
       </div>
     </section>
   `;
@@ -473,8 +529,10 @@ function handleClick(event: Event): void {
     void confirmDelete(button.dataset.chatId, button.dataset.messageId);
   } else if (action === 'save-settings') {
     saveSettingsFromDom();
+  } else if (action === 'restore-default-prompts') {
+    restoreDefaultPrompts();
   } else if (action === 'save-schema') {
-    saveSchemaFromDom();
+    saveSchemaFromDom(getRootForAction(button));
   } else if (action === 'use-schema-for-chat') {
     ctxRef.sendToBackend({
       type: 'set_chat_schema',
@@ -520,12 +578,20 @@ function saveSettingsFromDom(): void {
   ctxRef.sendToBackend({ type: 'save_settings', settings: deepMergeSettings(state.settings) });
 }
 
-function saveSchemaFromDom(): void {
+function restoreDefaultPrompts(): void {
   if (!state) return;
-  const idInput = root.querySelector('[data-schema-field="id"]') as HTMLInputElement | null;
-  const nameInput = root.querySelector('[data-schema-field="name"]') as HTMLInputElement | null;
-  const schemaInput = root.querySelector('[data-schema-field="schema"]') as HTMLTextAreaElement | null;
-  const templateInput = root.querySelector('[data-schema-field="templateHtml"]') as HTMLTextAreaElement | null;
+  state.settings.systemPrompt = DEFAULT_SYSTEM_PROMPT;
+  state.settings.extractionPrompt = DEFAULT_EXTRACTION_PROMPT;
+  ctxRef.sendToBackend({ type: 'save_settings', settings: deepMergeSettings(state.settings) });
+  render();
+}
+
+function saveSchemaFromDom(sourceRoot: HTMLElement): void {
+  if (!state) return;
+  const idInput = sourceRoot.querySelector('[data-schema-field="id"]') as HTMLInputElement | null;
+  const nameInput = sourceRoot.querySelector('[data-schema-field="name"]') as HTMLInputElement | null;
+  const schemaInput = sourceRoot.querySelector('[data-schema-field="schema"]') as HTMLTextAreaElement | null;
+  const templateInput = sourceRoot.querySelector('[data-schema-field="templateHtml"]') as HTMLTextAreaElement | null;
   if (!idInput || !nameInput || !schemaInput || !templateInput) return;
 
   try {
@@ -543,6 +609,10 @@ function saveSchemaFromDom(): void {
   } catch (error) {
     showErrorModal(error instanceof Error ? error.message : String(error));
   }
+}
+
+function getRootForAction(button: HTMLElement): HTMLElement {
+  return (button.closest('.tracktor-root') as HTMLElement | null) ?? roots[0];
 }
 
 function openEditModal(chatId?: string, messageId?: string): void {
@@ -702,6 +772,10 @@ const TRACKTOR_SMALL_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" ari
 
 const STYLES = `
   .tracktor-root { height: 100%; overflow: auto; color: var(--lumiverse-text); }
+  .tracktor-settings-surface {
+    min-height: 0;
+    padding-block: 8px;
+  }
   .tracktor-floating-launcher {
     position: fixed;
     right: 16px;

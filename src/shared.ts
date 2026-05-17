@@ -1,7 +1,7 @@
 export const EXTENSION_ID = 'tracktor';
 export const METADATA_KEY = 'tracktor';
 export const SETTINGS_PATH = 'settings.json';
-export const VERSION = '0.1.0';
+export const VERSION = '0.1.2';
 
 export type MessageRole = 'system' | 'user' | 'assistant';
 export type TrackerGenerationMode = 'json' | 'native_json';
